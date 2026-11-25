@@ -1,0 +1,41 @@
+name: Notify Google Chat
+description: Post a CI/CD result to a Google Chat space as a card.
+
+inputs:
+  webhook:
+    description: Google Chat incoming webhook URL. Pass a secret — it grants post access to the space.
+    required: true
+  title:
+    description: Short label for what ran, e.g. "deploy-api-prod".
+    required: true
+  status:
+    description: >-
+      Job status, normally passed as the job.status context value.
+      One of success, failure, cancelled.
+    required: true
+  details:
+    description: >-
+      Optional extra facts, one per line. A line shaped "Label: value" renders as
+      a labelled row; anything else renders as a plain paragraph.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Post to Google Chat
+      shell: bash
+      env:
+        # Everything reaches the script through the environment. Interpolating
+        # SUBJECT into `run:` would let a commit message execute shell.
+        WEBHOOK: ${{ inputs.webhook }}
+        TITLE: ${{ inputs.title }}
+        STATUS: ${{ inputs.status }}
+        DETAILS: ${{ inputs.details }}
+        REPO: ${{ github.repository }}
+        REF: ${{ github.ref_name }}
+        SHA: ${{ github.sha }}
+        ACTOR: ${{ github.actor }}
+        SUBJECT: ${{ github.event.head_commit.message }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: python3 "$GITHUB_ACTION_PATH/notify.py"
