@@ -1,0 +1,371 @@
+name: security-scan
+
+# Reusable security gate, shared across projects. Call it as the first job of a
+# deploy workflow:
+#
+#   jobs:
+#     security-scan:
+#       uses: HX-Platform/security-scan/.github/workflows/security-scan.yml@v1
+#       with:
+#         caller: deploy-api-dev
+#       secrets: inherit
+#
+# It scans the CALLER's checkout, so the caller's .trivyignore, .semgrepignore
+# and .gitleaks.toml apply. By default it is REPORT-ONLY (`enforce: false`):
+# findings are shown in the tables and alerted, but never fail the run or stop
+# a deploy. Set `enforce: true` to make the gate block.
+#
+# Every scanner writes JSON, which is rendered as a markdown table in the job
+# summary and uploaded as an artifact. The gate (only when enforce is true) is decided from the counts:
+#   Trivy    -> any CRITICAL (vuln / secret / misconfig, unfixed ignored)
+#   Gitleaks -> any leak in the pushed commits
+#   Semgrep  -> any ERROR finding (Semgrep has no CRITICAL level)
+# Lower severities are shown in the tables but never block, even when enforced.
+
+on:
+  workflow_call:
+    inputs:
+      caller:
+        description: Label of the calling workflow, used in the summary and the alert title.
+        type: string
+        required: false
+        default: manual
+      scan_paths:
+        description: Space-separated paths Semgrep scans and Gitleaks limits commits to.
+        type: string
+        required: false
+        default: "."
+      trivy_skip_dirs:
+        description: Comma-separated directories Trivy skips (narrows its repo-wide scan).
+        type: string
+        required: false
+        default: ""
+      trivy_skip_files:
+        description: Comma-separated files Trivy skips.
+        type: string
+        required: false
+        default: ""
+      semgrep_config:
+        description: Space-separated Semgrep rulesets (e.g. "p/typescript p/nodejs", "p/python").
+        type: string
+        required: false
+        default: p/default
+      enforce:
+        description: Fail the run (and block the deploy that needs it) on blocking findings.
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      GOOGLE_CHAT_WEBHOOK:
+        required: false
+  workflow_dispatch:
+    inputs:
+      enforce:
+        description: Fail the run on blocking findings.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.28.0
+  SEMGREP_IMAGE: semgrep/semgrep:1.131.0
+  MAX_ROWS: 100
+
+jobs:
+  trivy:
+    name: Trivy (deps, secrets, IaC)
+    runs-on: ubuntu-latest
+    outputs:
+      blocking: ${{ steps.count.outputs.blocking }}
+      total: ${{ steps.count.outputs.total }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # exit-code 0: the gate is the count step below, so the scan runs once.
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          hide-progress: true
+          format: json
+          output: trivy.json
+          exit-code: "0"
+          skip-dirs: ${{ inputs.trivy_skip_dirs }}
+          skip-files: ${{ inputs.trivy_skip_files }}
+
+      - name: Count findings
+        id: count
+        run: |
+          FILTER='[.Results[]? | (.Vulnerabilities[]?, .Secrets[]?, .Misconfigurations[]?)]'
+          echo "total=$(jq "$FILTER | length" trivy.json)" >> "$GITHUB_OUTPUT"
+          echo "blocking=$(jq "$FILTER | map(select(.Severity==\"CRITICAL\")) | length" trivy.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Render table
+        if: always()
+        env:
+          TOTAL: ${{ steps.count.outputs.total }}
+        run: |
+          {
+            echo "### Trivy — dependencies, secrets, IaC"
+            if [[ "${TOTAL:-0}" == "0" ]]; then
+              echo "✅ No HIGH/CRITICAL findings"
+            else
+              echo "| Severity | Type | Target | ID | Package / Location | Fix | Title |"
+              echo "|---|---|---|---|---|---|---|"
+              jq -r --argjson max "$MAX_ROWS" 'def c: tostring|gsub("\\|";"\\|")|gsub("[\r\n]+";" ");
+                [ .Results[]? as $r |
+                  ( $r.Vulnerabilities[]?   | [.Severity,"vuln",$r.Target,.VulnerabilityID,"\(.PkgName) \(.InstalledVersion)",(.FixedVersion//"-"),(.Title//"-")] ),
+                  ( $r.Secrets[]?           | [.Severity,"secret",$r.Target,.RuleID,"line \(.StartLine)","-",(.Title//"-")] ),
+                  ( $r.Misconfigurations[]? | [.Severity,"misconfig",$r.Target,.ID,"-",(.Resolution//"-"),(.Title//"-")] )
+                ] | sort_by(.[0]!="CRITICAL") | .[:$max][] | "| " + (map(c)|join(" | ")) + " |"' trivy.json
+              if (( TOTAL > MAX_ROWS )); then
+                echo ""
+                echo "Showing $MAX_ROWS of $TOTAL — full report in artifact \`trivy-report\`."
+              fi
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Gate on CRITICAL
+        if: ${{ inputs.enforce }}
+        env:
+          BLOCKING: ${{ steps.count.outputs.blocking }}
+        run: |
+          if [[ "${BLOCKING:-0}" != "0" ]]; then
+            echo "::error::Trivy found $BLOCKING CRITICAL finding(s)"
+            exit 1
+          fi
+
+  gitleaks:
+    name: Gitleaks (secrets in pushed commits)
+    runs-on: ubuntu-latest
+    outputs:
+      blocking: ${{ steps.count.outputs.blocking }}
+      total: ${{ steps.count.outputs.total }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Only the commits of this push: a leak already in history would
+      # otherwise block every deploy forever.
+      - name: Run Gitleaks
+        env:
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+          SCAN_PATHS: ${{ inputs.scan_paths || '.' }}
+        run: |
+          if [[ -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            RANGE="${BEFORE}..${SHA}"
+          else
+            RANGE="-1 ${SHA}"
+          fi
+          # Pathspec: only commits touching this app's paths.
+          RANGE="$RANGE -- $SCAN_PATHS"
+          echo "Scanning commits: $RANGE"
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/repo" "$GITLEAKS_IMAGE" git /repo \
+            --redact --log-opts="$RANGE" \
+            --report-format json --report-path /repo/gitleaks.json --exit-code 0
+
+      # Gitleaks has no severity: every leak blocks.
+      - name: Count findings
+        id: count
+        run: |
+          N=$(jq length gitleaks.json)
+          echo "total=$N" >> "$GITHUB_OUTPUT"
+          echo "blocking=$N" >> "$GITHUB_OUTPUT"
+
+      # The secret value is never printed, even redacted.
+      - name: Render table
+        if: always()
+        env:
+          TOTAL: ${{ steps.count.outputs.total }}
+        run: |
+          {
+            echo "### Gitleaks — secrets in pushed commits"
+            if [[ "${TOTAL:-0}" == "0" ]]; then
+              echo "✅ No leaks"
+            else
+              echo "| Rule | File | Line | Commit | Author |"
+              echo "|---|---|---|---|---|"
+              jq -r --argjson max "$MAX_ROWS" 'def c: tostring|gsub("\\|";"\\|")|gsub("[\r\n]+";" ");
+                .[:$max][] | [.RuleID,.File,.StartLine,(.Commit[:7]),.Author] | "| " + (map(c)|join(" | ")) + " |"' gitleaks.json
+              if (( TOTAL > MAX_ROWS )); then
+                echo ""
+                echo "Showing $MAX_ROWS of $TOTAL — full report in artifact \`gitleaks-report\`."
+              fi
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Gate on any leak
+        if: ${{ inputs.enforce }}
+        env:
+          BLOCKING: ${{ steps.count.outputs.blocking }}
+        run: |
+          if [[ "${BLOCKING:-0}" != "0" ]]; then
+            echo "::error::Gitleaks found $BLOCKING leak(s)"
+            exit 1
+          fi
+
+  semgrep:
+    name: Semgrep (SAST)
+    runs-on: ubuntu-latest
+    outputs:
+      blocking: ${{ steps.count.outputs.blocking }}
+      total: ${{ steps.count.outputs.total }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Run through docker on the runner so jq is available for the table.
+      - name: Run Semgrep
+        env:
+          SCAN_PATHS: ${{ inputs.scan_paths || '.' }}
+          SEMGREP_CONFIG: ${{ inputs.semgrep_config || 'p/default' }}
+        run: |
+          read -ra TARGETS <<< "$SCAN_PATHS"
+          CONFIGS=()
+          for c in $SEMGREP_CONFIG; do CONFIGS+=(--config "$c"); done
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan "${CONFIGS[@]}" \
+            --severity ERROR --severity WARNING --metrics=off \
+            --json --output semgrep.json "${TARGETS[@]}"
+
+      - name: Count findings
+        id: count
+        run: |
+          echo "total=$(jq '.results | length' semgrep.json)" >> "$GITHUB_OUTPUT"
+          echo "blocking=$(jq '[.results[] | select(.extra.severity=="ERROR")] | length' semgrep.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Render table
+        if: always()
+        env:
+          TOTAL: ${{ steps.count.outputs.total }}
+        run: |
+          {
+            echo "### Semgrep — SAST"
+            if [[ "${TOTAL:-0}" == "0" ]]; then
+              echo "✅ No findings"
+            else
+              echo "| Severity | Rule | File | Line | Message |"
+              echo "|---|---|---|---|---|"
+              jq -r --argjson max "$MAX_ROWS" 'def c: tostring|gsub("\\|";"\\|")|gsub("[\r\n]+";" ");
+                [.results[] | [.extra.severity,.check_id,.path,.start.line,(.extra.message[:200])]]
+                | sort_by(.[0]!="ERROR") | .[:$max][] | "| " + (map(c)|join(" | ")) + " |"' semgrep.json
+              if (( TOTAL > MAX_ROWS )); then
+                echo ""
+                echo "Showing $MAX_ROWS of $TOTAL — full report in artifact \`semgrep-report\`."
+              fi
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Gate on ERROR
+        if: ${{ inputs.enforce }}
+        env:
+          BLOCKING: ${{ steps.count.outputs.blocking }}
+        run: |
+          if [[ "${BLOCKING:-0}" != "0" ]]; then
+            echo "::error::Semgrep found $BLOCKING ERROR finding(s)"
+            exit 1
+          fi
+
+  report:
+    name: Overview
+    needs: [trivy, gitleaks, semgrep]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Overview table
+        env:
+          CALLER: ${{ inputs.caller }}
+          ENFORCE: ${{ inputs.enforce }}
+          SHA: ${{ github.sha }}
+          TRIVY_RESULT: ${{ needs.trivy.result }}
+          TRIVY_BLOCKING: ${{ needs.trivy.outputs.blocking }}
+          TRIVY_TOTAL: ${{ needs.trivy.outputs.total }}
+          GITLEAKS_RESULT: ${{ needs.gitleaks.result }}
+          GITLEAKS_BLOCKING: ${{ needs.gitleaks.outputs.blocking }}
+          GITLEAKS_TOTAL: ${{ needs.gitleaks.outputs.total }}
+          SEMGREP_RESULT: ${{ needs.semgrep.result }}
+          SEMGREP_BLOCKING: ${{ needs.semgrep.outputs.blocking }}
+          SEMGREP_TOTAL: ${{ needs.semgrep.outputs.total }}
+        run: |
+          icon() { [[ "$1" == "success" ]] && echo "✅ success" || echo "❌ $1"; }
+          num() { echo "${1:-n/a}"; }
+          {
+            echo "## 🔒 Security scan — ${CALLER:-manual} @ ${SHA:0:7}"
+            if [[ "$ENFORCE" == "true" ]]; then
+              echo "Mode: **enforced** — blocking findings fail the run."
+            else
+              echo "Mode: **report-only** — findings never block the deploy."
+            fi
+            echo ""
+            echo "| Scanner | Result | Blocking findings | Total findings | Blocks on (if enforced) |"
+            echo "|---|---|---|---|---|"
+            echo "| Trivy | $(icon "$TRIVY_RESULT") | $(num "$TRIVY_BLOCKING") | $(num "$TRIVY_TOTAL") | CRITICAL |"
+            echo "| Gitleaks | $(icon "$GITLEAKS_RESULT") | $(num "$GITLEAKS_BLOCKING") | $(num "$GITLEAKS_TOTAL") | any leak |"
+            echo "| Semgrep | $(icon "$SEMGREP_RESULT") | $(num "$SEMGREP_BLOCKING") | $(num "$SEMGREP_TOTAL") | ERROR |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: Notify on failure
+    needs: [trivy, gitleaks, semgrep]
+    # Alert on blocking findings even in report-only mode, and on scanner errors.
+    if: >-
+      ${{ always() && (
+        contains(needs.*.result, 'failure') ||
+        (needs.trivy.outputs.blocking || '0') != '0' ||
+        (needs.gitleaks.outputs.blocking || '0') != '0' ||
+        (needs.semgrep.outputs.blocking || '0') != '0') }}
+    runs-on: ubuntu-latest
+    steps:
+      # Fully qualified: a `./` path would resolve against the caller's repo.
+      # Keep this ref in step with the release tag callers pin (see README).
+      - name: Notify Google Chat
+        uses: HX-Platform/security-scan/.github/actions/notify-google-chat@v1
+        with:
+          webhook: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          title: security-scan findings (${{ inputs.caller }}, ${{ inputs.enforce && 'enforced' || 'report-only' }})
+          status: failure
+          details: |
+            Trivy: ${{ needs.trivy.outputs.blocking || 'n/a' }} critical
+            Gitleaks: ${{ needs.gitleaks.outputs.blocking || 'n/a' }} leaks
+            Semgrep: ${{ needs.semgrep.outputs.blocking || 'n/a' }} errors
